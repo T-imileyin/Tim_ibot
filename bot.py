@@ -178,5 +178,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-python-telegram-bot==22.8
-aiohttp==3.14.3
