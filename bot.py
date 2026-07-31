@@ -6,13 +6,13 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ==================== CONFIGURATION ====================
-TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"  # Replace with your Bot Token
-TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"      # Replace with your Chat ID
-CHECK_INTERVAL = 15                            # Polling frequency in seconds
+TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"  # Ensure your real Bot Token is pasted here
+TELEGRAM_CHAT_ID = "6411468031"                  # Updated with your Personal Chat ID
+CHECK_INTERVAL = 15                              # Polling frequency in seconds
 
 # Safety Filter Limits
-MAX_TOP_10_SUPPLY_PCT = 30.0                   # Block coins where Top 10 hold > 30%
-MAX_RUGCHECK_SCORE = 1000                      # Block coins rated HIGH RISK (> 1000)
+MAX_TOP_10_SUPPLY_PCT = 30.0                     # Block coins where Top 10 hold > 30%
+MAX_RUGCHECK_SCORE = 1000                        # Block coins rated HIGH RISK (> 1000)
 # =======================================================
 
 logging.basicConfig(
@@ -247,16 +247,19 @@ async def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("check", check_command))
     
-    await app.initialize()
-    await app.start()
-    
-    # Start polling loop
-    asyncio.create_task(poll_dex_screener(app.bot))
-    
-    logging.info("🚀 Solana DEX Scanner initialized...")
-    
-    while True:
-        await asyncio.sleep(3600)
+    # Correct Async Application lifecycle initialization
+    async with app:
+        await app.start()
+        await app.updater.start_polling()
+        
+        # Start background polling task
+        asyncio.create_task(poll_dex_screener(app.bot))
+        
+        logging.info("🚀 Solana DEX Scanner initialized...")
+        
+        # Keep application running indefinitely
+        while True:
+            await asyncio.sleep(3600)
 
 if __name__ == "__main__":
     asyncio.run(main())
