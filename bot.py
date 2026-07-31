@@ -6,7 +6,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ==================== CONFIGURATION ====================
-TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"  # Ensure your real Bot Token is pasted here
+TELEGRAM_BOT_TOKEN = "7123456789:AAEfGhIjKlMnOpQrStUvWxYz1234567"  # Ensure your real Bot Token is pasted here
 TELEGRAM_CHAT_ID = "6411468031"                  # Updated with your Personal Chat ID
 CHECK_INTERVAL = 15                              # Polling frequency in seconds
 
