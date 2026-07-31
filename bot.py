@@ -1,180 +1,290 @@
 import asyncio
 import logging
+import os
+import time
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 import aiohttp
-from telegram import Bot
 
-# ================= CONFIGURATION =================
-TELEGRAM_BOT_TOKEN = "8809386346:AAEt_7REbKpPEJIS5uV06GXbVCYMflE1M44"
-TELEGRAM_CHAT_ID = "6411468031"
+# Configure Logging
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
 
-CHECK_INTERVAL = 15  # Scan interval in seconds
+# Configuration Constants
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
+CHAT_ID = os.getenv("CHAT_ID", "")  # Optional: default chat ID for auto-alerts
 
-# Your Strict Criteria
-MIN_HOLDERS = 2000
-MAX_TOP10_HOLDERS_PCT = 25.0
-MAX_SNIPER_PCT = 10.0
-# =================================================
+CHECK_INTERVAL = 30  # Seconds between automated DEX scans
+MAX_WATCHLIST_SIZE = 20
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-seen_tokens = set()
+# In-Memory Watchlist Storage (RAM)
+WATCHLIST = {}  # Format: {mint_address: {"added_at": timestamp, "initial_mc": float}}
 
-def format_number(val):
-    """Formats raw numbers into readable strings (e.g. $2.1M, $146K)."""
-    if val is None:
+# Helper: Format Coin Age
+def format_coin_age(pair_created_at_ms):
+    if not pair_created_at_ms:
         return "N/A"
-    val = float(val)
+    diff_sec = time.time() - (pair_created_at_ms / 1000.0)
+    if diff_sec < 0:
+        return "Just now"
+    if diff_sec < 60:
+        return f"{int(diff_sec)}s"
+    elif diff_sec < 3600:
+        return f"{int(diff_sec / 60)}m"
+    elif diff_sec < 86400:
+        return f"{int(diff_sec / 3600)}h"
+    elif diff_sec < 2592000:
+        return f"{int(diff_sec / 86400)}d"
+    else:
+        return f"{int(diff_sec / 2592000)}mo"
+
+# Helper: Format Currency Numbers
+def format_num(val):
+    if not val:
+        return "$0"
     if val >= 1_000_000:
-        return f"${val / 1_000_000:.1f}M"
+        return f"${val / 1_000_000:.2f}M"
     elif val >= 1_000:
         return f"${val / 1_000:.1f}K"
-    return f"${val:.1f}"
+    return f"${val:,.0f}"
 
-async def fetch_dex_pair_data(session: aiohttp.ClientSession, mint_address: str) -> dict:
-    """Fetches market cap, liquidity, volume, and social links from DEX Screener."""
+# API Fetcher: DEX Screener Token Data
+async def fetch_dex_pair_data(session, mint_address):
     url = f"https://api.dexscreener.com/latest/dex/tokens/{mint_address}"
     try:
         async with session.get(url, timeout=10) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                pairs = data.get("pairs", [])
+                pairs = data.get("pairs")
                 if pairs:
-                    # Return primary/highest liquidity pair
-                    return pairs[0]
+                    # Prefer Solana pairs
+                    sol_pairs = [p for p in pairs if p.get("chainId") == "solana"]
+                    return sol_pairs[0] if sol_pairs else pairs[0]
     except Exception as e:
-        logging.error(f"DEX Screener fetch error: {e}")
-    return {}
+        logging.error(f"Error fetching DEX Screener data for {mint_address}: {e}")
+    return None
 
-async def audit_token_rugcheck(session: aiohttp.ClientSession, mint_address: str) -> tuple[bool, str, dict]:
-    """Audits token security & holder metrics via RugCheck API."""
-    url = f"https://api.rugcheck.xyz/v1/tokens/{mint_address}/report"
+# API Fetcher: RugCheck Summary
+async def fetch_rugcheck_data(session, mint_address):
+    url = f"https://api.rugcheck.xyz/v1/tokens/{mint_address}/report/summary"
     try:
-        async with session.get(url, timeout=12) as resp:
-            if resp.status != 200:
-                return False, f"RugCheck API returned status {resp.status}", {}
-
-            data = await resp.json()
-
-            # 1. Authority Checks
-            mint_disabled = not data.get("token", {}).get("mintAuthority")
-            freeze_disabled = not data.get("token", {}).get("freezeAuthority")
-
-            if not mint_disabled:
-                return False, "Mint authority is enabled", {}
-            if not freeze_disabled:
-                return False, "Freeze authority is enabled", {}
-
-            # 2. Holder Metrics
-            total_holders = data.get("totalHolders", 0)
-            if total_holders < MIN_HOLDERS:
-                return False, f"Holders too low ({total_holders} < {MIN_HOLDERS})", {}
-
-            # Calculate Top 10 Holders Percentage
-            top_holders = data.get("topHolders", [])
-            top10_pct = sum(h.get("pct", 0) for h in top_holders[:10])
-            if top10_pct > MAX_TOP10_HOLDERS_PCT:
-                return False, f"Top 10 holders too high ({top10_pct:.1f}% > {MAX_TOP10_HOLDERS_PCT}%)", {}
-
-            # 3. Sniper / Block 0 Check
-            risks = data.get("risks", [])
-            sniper_pct = 0.0
-            for r in risks:
-                if "sniper" in r.get("name", "").lower() or "block 0" in r.get("description", "").lower():
-                    sniper_pct = float(r.get("value", 0.0))
-
-            if sniper_pct > MAX_SNIPER_PCT:
-                return False, f"Block 0/Sniper allocation too high ({sniper_pct:.1f}% > {MAX_SNIPER_PCT}%)", {}
-
-            # Extract Dev details & Bundles
-            dev_address = data.get("creator", "Unknown")
-            dev_sol_bal = data.get("creatorBalance", 0) / 1e9 if data.get("creatorBalance") else 0.0
-
-            parsed_data = {
-                "holders": total_holders,
-                "top10_pct": top10_pct,
-                "sniper_pct": sniper_pct,
-                "dev_address": dev_address,
-                "dev_sol": dev_sol_bal,
-                "risks_count": len(risks),
-                "score": data.get("score", 0)
-            }
-
-            return True, "Passed all criteria", parsed_data
-
+        async with session.get(url, timeout=10) as resp:
+            if resp.status == 200:
+                return await resp.json()
     except Exception as e:
-        return False, f"RugCheck Audit Exception: {e}", {}
+        logging.error(f"Error fetching RugCheck data for {mint_address}: {e}")
+    return None
 
-async def send_ttf_styled_alert(bot: Bot, pair: dict, audit: dict):
-    """Formats and dispatches the exact TTF-styled Telegram notification card."""
-    base_token = pair.get("baseToken", {})
-    token_name = base_token.get("name", "Unknown Token")
-    token_symbol = base_token.get("symbol", "UNKNOWN")
+# Build Soul-Styled Message
+def build_soul_styled_message(pair_data, rug_data=None, note=""):
+    base_token = pair_data.get("baseToken", {})
+    symbol = base_token.get("symbol", "UNKNOWN")
+    name = base_token.get("name", "")
     mint_addr = base_token.get("address", "")
 
-    mc = format_number(pair.get("fdv") or pair.get("marketCap"))
-    liq = format_number(pair.get("liquidity", {}).get("usd"))
-    vol_1h = format_number(pair.get("volume", {}).get("h1"))
+    age_str = format_coin_age(pair_data.get("pairCreatedAt"))
+    mc = pair_data.get("fdv") or pair_data.get("marketCap", 0)
+    liq_usd = pair_data.get("liquidity", {}).get("usd", 0)
+    liq_sol = pair_data.get("liquidity", {}).get("quote", 0)
+    vol_1h = pair_data.get("volume", {}).get("h1", 0)
+
+    # Price changes
+    p_change_1h = pair_data.get("priceChange", {}).get("h1", 0)
+
+    # Socials
+    info = pair_data.get("info", {})
+    socials = info.get("socials", [])
+    websites = info.get("websites", [])
+    has_x = "✅" if any(s.get("type") == "twitter" for s in socials) else "❌"
+    has_web = "✅" if len(websites) > 0 else "❌"
+
+    # Security & Intelligence Heuristics
+    txns_1h = pair_data.get("txns", {}).get("h1", {})
+    total_txns = txns_1h.get("buys", 0) + txns_1h.get("sells", 0)
     
-    dex_url = pair.get("url", f"https://dexscreener.com/solana/{mint_addr}")
-    solscan_url = f"https://solscan.io/token/{mint_addr}"
+    # Fake Volume Flag
+    fake_vol_warning = ""
+    if vol_1h > 100000 and total_txns < 30:
+        fake_vol_warning = "\n⚠️ <b>ALERT:</b> High chance of Fake Wash Volume!"
 
-    message = (
-        f"💊🔁 *{token_name}* • `${token_symbol}`\n"
-        f"🕒 *Age:* New Listing • 🤝 *CTO Check:* Passed\n"
-        f"💰 *MC:* `{mc}`\n"
-        f"💧 *Liq:* `{liq}`\n"
-        f"📊 *Vol (1h):* `{vol_1h}`\n\n"
-        f"🦅 *Dex:* [DexScreener]({dex_url})\n"
-        f"⚡ *Scans Audit:* Safe Score `{audit.get('score')}` | 🔗 [Solscan]({solscan_url})\n"
-        f"👥 *Hodls:* `{audit.get('holders'):,}` • *Top 10:* `{audit.get('top10_pct'):.1f}%`\n\n"
-        f"🔫 *Snipers / Block 0:* `{audit.get('sniper_pct'):.1f}%` 🤍\n"
-        f"🎯 *Top 10 Supply:* `{audit.get('top10_pct'):.1f}%`\n\n"
-        f"🛠️ *Dev Wallet:* `{audit.get('dev_sol'):.2f} SOL`\n"
-        f"📋 *Contract:* `{mint_addr}`"
+    # RugCheck Status
+    mint_auth = "Disabled ✅"
+    freeze_auth = "Disabled ✅"
+    if rug_data:
+        risks = rug_data.get("risks", [])
+        for r in risks:
+            if "Mint Authority" in r.get("name", ""):
+                mint_auth = "Enabled 🚨"
+            if "Freeze Authority" in r.get("name", ""):
+                freeze_auth = "Enabled 🚨"
+
+    header_prefix = f"<b>[{note}]</b>\n" if note else ""
+
+    msg = (
+        f"{header_prefix}"
+        f"💊🔁 <b>{name}</b> • <b>${symbol}</b>\n"
+        f"🕒 <b>Age:</b> {age_str} [-{abs(p_change_1h):.0f}%] • 🤝 <b>CTO</b>\n"
+        f"💰 <b>MC:</b> {format_num(mc)}\n"
+        f"💧 <b>Liq:</b> {format_num(liq_usd)} [{liq_sol:,.0f} SOL]\n"
+        f"📊 <b>Vol (1h):</b> {format_num(vol_1h)}{fake_vol_warning}\n\n"
+        f"🦅 <b>Dex:</b> Paid✅ Ads❌ | 🔗 X:{has_x} WEB:{has_web}\n"
+        f"🛡️ <b>Mint:</b> {mint_auth} | <b>Freeze:</b> {freeze_auth}\n\n"
+        f"<code>{mint_addr}</code>"
     )
 
-    await bot.send_message(
-        chat_id=TELEGRAM_CHAT_ID,
-        text=message,
-        parse_mode="Markdown",
-        disable_web_page_preview=True
-    )
+    # Action Buttons
+    keyboard = [
+        [
+            InlineKeyboardButton("📊 DEXScreener", url=f"https://dexscreener.com/solana/{mint_addr}"),
+            InlineKeyboardButton("⚡ Photon", url=f"https://photon-sol.tinyastro.io/en/r/@bot/{mint_addr}")
+        ],
+        [
+            InlineKeyboardButton("🤖 Trojan", url=f"https://t.me/solana_trojanbot?start=r-user-{mint_addr}"),
+            InlineKeyboardButton("🚀 BonkBot", url=f"https://t.me/bonkbot_bot?start={mint_addr}")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    return msg, reply_markup
 
-async def main():
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
-    logging.info("🚀 TTF Token Filter Bot Active! Polling DEX Screener...")
+# Telegram Command: /start
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    welcome_text = (
+        "🤖 <b>Solana Scanner & Watchlist Bot Active!</b>\n\n"
+        "<b>Commands:</b>\n"
+        "• <code>/add &lt;mint_address&gt;</code> - Add coin to watchlist (max 20)\n"
+        "• <code>/remove &lt;mint_address&gt;</code> - Remove coin from watchlist\n"
+        "• <code>/list</code> - View tracked coins with live performance\n"
+        "• <code>/clear</code> - Clear all coins from watchlist"
+    )
+    await update.message.reply_text(welcome_text, parse_mode="HTML")
+
+# Telegram Command: /add <mint>
+async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(WATCHLIST) >= MAX_WATCHLIST_SIZE:
+        await update.message.reply_text(f"❌ Watchlist is full! Maximum limit is {MAX_WATCHLIST_SIZE} coins.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("⚠️ Please provide a mint address:\n<code>/add &lt;mint_address&gt;</code>", parse_mode="HTML")
+        return
+
+    mint_addr = context.args[0].strip()
+
+    if mint_addr in WATCHLIST:
+        await update.message.reply_text("ℹ️ This coin is already in your watchlist.")
+        return
 
     async with aiohttp.ClientSession() as session:
-        while True:
-            try:
-                # Poll DEX Screener for recently created/updated profiles
-                async with session.get("https://api.dexscreener.com/token-profiles/latest/v1", timeout=10) as resp:
-                    if resp.status == 200:
-                        profiles = await resp.json()
-                        for p in profiles:
-                            if p.get("chainId") != "solana":
-                                continue
+        pair_data = await fetch_dex_pair_data(session, mint_addr)
+        if not pair_data:
+            await update.message.reply_text("❌ Could not find token data on DEX Screener. Check the mint address.")
+            return
 
-                            mint_addr = p.get("tokenAddress")
-                            if not mint_addr or mint_addr in seen_tokens:
-                                continue
+        mc = pair_data.get("fdv") or pair_data.get("marketCap", 0)
+        WATCHLIST[mint_addr] = {
+            "added_at": time.time(),
+            "initial_mc": mc,
+            "symbol": pair_data.get("baseToken", {}).get("symbol", "UNKNOWN")
+        }
 
-                            seen_tokens.add(mint_addr)
+        rug_data = await fetch_rugcheck_data(session, mint_addr)
+        msg, reply_markup = build_soul_styled_message(pair_data, rug_data, note="ADDED TO WATCHLIST")
+        await update.message.reply_text(msg, parse_mode="HTML", reply_markup=reply_markup)
 
-                            # Perform Security & Holder Checks
-                            passed, reason, audit_metrics = await audit_token_rugcheck(session, mint_addr)
-                            
-                            if passed:
-                                pair_data = await fetch_dex_pair_data(session, mint_addr)
-                                if pair_data:
-                                    logging.info(f"✅ PASSED: {mint_addr}")
-                                    await send_ttf_styled_alert(bot, pair_data, audit_metrics)
-                            else:
-                                logging.info(f"❌ REJECTED ({mint_addr[:8]}...): {reason}")
+# Telegram Command: /remove <mint>
+async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("⚠️ Usage: <code>/remove &lt;mint_address&gt;</code>", parse_mode="HTML")
+        return
 
-            except Exception as e:
-                logging.error(f"Polling loop error: {e}")
+    mint_addr = context.args[0].strip()
+    if mint_addr in WATCHLIST:
+        symbol = WATCHLIST[mint_addr].get("symbol", "")
+        del WATCHLIST[mint_addr]
+        await update.message.reply_text(f"✅ Removed <b>${symbol}</b> (<code>{mint_addr}</code>) from watchlist.", parse_mode="HTML")
+    else:
+        await update.message.reply_text("❌ Coin not found in watchlist.")
 
-            await asyncio.sleep(CHECK_INTERVAL)
+# Telegram Command: /clear
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    WATCHLIST.clear()
+    await update.message.reply_text("🧹 Watchlist cleared completely!")
+
+# Telegram Command: /list
+async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not WATCHLIST:
+        await update.message.reply_text("📋 Your watchlist is currently empty. Add coins with <code>/add &lt;mint&gt;</code>", parse_mode="HTML")
+        return
+
+    status_msg = await update.message.reply_text("🔄 Fetching live data for tracked coins...")
+
+    items_text = []
+    async with aiohttp.ClientSession() as session:
+        for idx, (mint_addr, data) in enumerate(list(WATCHLIST.items()), start=1):
+            pair_data = await fetch_dex_pair_data(session, mint_addr)
+            if not pair_data:
+                items_text.append(f"{idx}. <code>{mint_addr[:8]}...</code> - Data fetch failed")
+                continue
+
+            symbol = pair_data.get("baseToken", {}).get("symbol", "UNKNOWN")
+            age_str = format_coin_age(pair_data.get("pairCreatedAt"))
+            mc = pair_data.get("fdv") or pair_data.get("marketCap", 0)
+            liq_usd = pair_data.get("liquidity", {}).get("usd", 0)
+            p_change_1h = pair_data.get("priceChange", {}).get("h1", 0)
+
+            # PnL performance since added
+            init_mc = data.get("initial_mc", mc)
+            pnl_perc = (((mc - init_mc) / init_mc) * 100) if init_mc > 0 else 0
+            pnl_str = f"+{pnl_perc:.1f}%" if pnl_perc >= 0 else f"{pnl_perc:.1f}%"
+
+            items_text.append(
+                f"<b>{idx}. ${symbol}</b> • <code>{mint_addr[:6]}...{mint_addr[-4:]}</code>\n"
+                f"   🕒 Age: {age_str} | 💧 Liq: {format_num(liq_usd)} | 💰 MC: {format_num(mc)}\n"
+                f"   📈 PnL: <b>{pnl_str}</b> | 1h Change: {p_change_1h:.1f}%\n"
+            )
+
+    report = f"📋 <b>LIVE WATCHLIST ({len(WATCHLIST)}/{MAX_WATCHLIST_SIZE})</b>\n\n" + "\n".join(items_text)
+    await status_msg.edit_text(report, parse_mode="HTML")
+
+# Background Scanner Loop (Dip & Rebound Alerts for Tracked Coins)
+async def background_watchlist_scanner(app):
+    while True:
+        try:
+            if WATCHLIST:
+                async with aiohttp.ClientSession() as session:
+                    for mint_addr in list(WATCHLIST.keys()):
+                        pair_data = await fetch_dex_pair_data(session, mint_addr)
+                        if pair_data:
+                            p_change_1h = pair_data.get("priceChange", {}).get("h1", 0)
+                            # Alert if tracked coin dips significantly (-20% to -60%)
+                            if -60 <= p_change_1h <= -20:
+                                rug_data = await fetch_rugcheck_data(session, mint_addr)
+                                msg, reply_markup = build_soul_styled_message(pair_data, rug_data, note="DIP DETECTED 📉")
+                                if CHAT_ID:
+                                    await app.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="HTML", reply_markup=reply_markup)
+        except Exception as e:
+            logging.error(f"Error in background scanner: {e}")
+        await asyncio.sleep(CHECK_INTERVAL)
+
+# Main Application Entry Point
+def main():
+    if TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
+        print("❌ Please set your TELEGRAM_BOT_TOKEN environment variable!")
+        return
+
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Add Command Handlers
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("add", add_command))
+    app.add_handler(CommandHandler("remove", remove_command))
+    app.add_handler(CommandHandler("clear", clear_command))
+    app.add_handler(CommandHandler("list", list_command))
+
+    logging.info("Bot started successfully!")
+    app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
