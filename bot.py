@@ -258,8 +258,14 @@ async def main():
     
     async with app:
         await app.start()
-        # drop_pending_updates=True drops conflicting old updates and resets polling connections cleanly
+        
+        # 1. Force Telegram servers to disconnect any active webhook/session
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        # 2. Short pause to allow dying Railway containers to fully shut down
+        await asyncio.sleep(2)
+        # 3. Clean start for polling
         await app.updater.start_polling(drop_pending_updates=True)
+        
         asyncio.create_task(poll_dex_screener(app.bot))
         logging.info("🚀 Ultra Strict Scanner Started!")
         while True:
