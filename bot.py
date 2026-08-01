@@ -7,7 +7,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ==================== CONFIGURATION ====================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8809386346:AAESBd_4bp-bbiHWvHG4eHdxiUFCi1qhDFc")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8809386346:AAFVEb6hXB0E1OsfwJRsecIUTqqVSQbkemU")
 TELEGRAM_CHAT_ID = os.getenv("CHAT_ID", "YOUR_TELEGRAM_CHAT_ID")
 CHECK_INTERVAL = 15                            # Polling frequency in seconds
 
