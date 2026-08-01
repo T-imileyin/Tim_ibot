@@ -52,7 +52,7 @@ async def fetch_rugcheck_report(session, mint_address):
                 score = data.get("score", 0)
                 risks = data.get("risks", [])
                 
-                # Extract Holders (often at the top level or within a token object)
+                # Extract Holders
                 total_holders = data.get("totalHolders", 0)
                 if total_holders == 0 and data.get("token"):
                     total_holders = data.get("token", {}).get("holders", 0)
@@ -71,7 +71,6 @@ async def fetch_rugcheck_report(session, mint_address):
                 for r in risks:
                     name = r.get("name", "").lower()
                     try:
-                        # Attempt to parse numeric value from the risk profile
                         val = float(r.get("value", 0))
                     except (ValueError, TypeError):
                         val = 0.0
@@ -201,9 +200,6 @@ async def poll_dex_screener(bot):
                                 
                             rug_data = await fetch_rugcheck_report(session, mint_addr)
                             
-                            # ==========================================
-                            # 🔥 STRICT REJECTION LOGIC
-                            # ==========================================
                             if (
                                 rug_data["score"] > MAX_RUGCHECK_SCORE or 
                                 rug_data["total_holders"] < MIN_HOLDERS or
@@ -262,7 +258,8 @@ async def main():
     
     async with app:
         await app.start()
-        await app.updater.start_polling()
+        # drop_pending_updates=True drops conflicting old updates and resets polling connections cleanly
+        await app.updater.start_polling(drop_pending_updates=True)
         asyncio.create_task(poll_dex_screener(app.bot))
         logging.info("🚀 Ultra Strict Scanner Started!")
         while True:
