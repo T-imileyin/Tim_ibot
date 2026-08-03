@@ -5,11 +5,11 @@ import time
 import json
 import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 # ==================== CONFIGURATION ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8809386346:AAFVEb6hXB0E1OsfwJRsecIUTqqVSQbkemU")
-TELEGRAM_CHAT_ID = os.getenv("CHAT_ID", "YOUR_TELEGRAM_CHAT_ID")
+TELEGRAM_CHAT_ID = os.getenv("CHAT_ID", "6411468031")
 CHECK_INTERVAL = 15                            # Polling frequency in seconds
 
 # STRICT SECURITY FILTERS
@@ -35,7 +35,6 @@ logging.basicConfig(
 )
 
 def load_persistence():
-    """Load seen mints and tracked coins from disk to survive container restarts."""
     global SEEN_MINTS, TRACKED_COINS
     try:
         if os.path.exists(SEEN_FILE):
@@ -48,7 +47,6 @@ def load_persistence():
         logging.error(f"Error loading persistence files: {e}")
 
 def save_persistence():
-    """Save seen mints and tracked coins to disk securely."""
     try:
         seen_list = list(SEEN_MINTS)[-1000:]
         with open(SEEN_FILE, "w") as f:
@@ -70,7 +68,6 @@ def format_coin_age(pair_created_at_ms):
     else: return f"{int(diff_sec / 86400)}d"
 
 async def fetch_rugcheck_report(session, mint_address):
-    """Fetch RugCheck security, parsing exact % for snipes, airdrops, and top holder risks"""
     url = f"https://api.rugcheck.xyz/v1/tokens/{mint_address}/report/summary"
     try:
         async with session.get(url, timeout=5) as response:
@@ -156,9 +153,10 @@ def build_advanced_card(pair_data, rug_data, extra_flag=None):
     wash_status = detect_wash_trading(txns_1h, vol_1h)
     
     dev_bundle_status = f"🚨 Dev Bundled {int(rug_data['snipe_pct'])}%" if rug_data['snipe_pct'] > 0 else "✅ Organic Deployment"
+    header_title = extra_flag if extra_flag else f"{name} • ${symbol}"
 
     msg = (
-        f"💊🔁 <b>{name} • ${symbol}</b>\n"
+        f"💊🔁 <b>{header_title}</b>\n"
         f"🚨 {dev_bundle_status}\n\n"
         f"🕒 <b>Age:</b> {age_str} [0%]\n"
         f"💰 <b>MC:</b> {mc_formatted} • 🔝$394K\n"
@@ -199,10 +197,22 @@ def get_quick_buy_keyboard(mint_addr):
     return InlineKeyboardMarkup(keyboard)
 
 async def fetch_latest_pairs(session):
-    url = "https://api.dexscreener.com/token-profiles/latest/v1"
-    async with session.get(url, timeout=10) as response:
-        if response.status == 200:
-            return await response.json()
+    # Aggregating from multiple decentralized endpoints and DEX screener source endpoints
+    endpoints = [
+        "https://api.dexscreener.com/token-profiles/latest/v1",
+        "https://api.dexscreener.com/latest/dex/search?q=solana"
+    ]
+    for url in endpoints:
+        try:
+            async with session.get(url, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if isinstance(data, list):
+                        return data
+                    elif isinstance(data, dict):
+                        return data.get("tokens", data.get("pairs", []))
+        except Exception as e:
+            logging.warning(f"Failed fetching from {url}: {e}")
     return []
 
 async def fetch_dex_pair_data(session, mint_address):
@@ -216,7 +226,6 @@ async def fetch_dex_pair_data(session, mint_address):
     return None
 
 async def poll_dex_screener(bot):
-    """Robust background polling loop with exponential backoff error recovery"""
     backoff = CHECK_INTERVAL
     load_persistence()
     
@@ -227,7 +236,7 @@ async def poll_dex_screener(bot):
                 backoff = CHECK_INTERVAL  
                 
                 for token in tokens:
-                    mint_addr = token.get("tokenAddress")
+                    mint_addr = token.get("tokenAddress") or token.get("address")
                     chain = token.get("chainId")
                     
                     if chain == "solana" and mint_addr and mint_addr not in SEEN_MINTS:
@@ -297,9 +306,9 @@ async def poll_dex_screener(bot):
                 
             await asyncio.sleep(backoff)
 
-# ==================== COMMAND HANDLERS ====================
+# ==================== COMMAND & MESSAGE HANDLERS ====================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = "🚀 <b>Strict Solana Pro Scanner Active!</b>\nFeatures active: Persistent state, Auto-reconnection, PnL tracking, Safe liquidity validation."
+    msg = "🚀 <b>Ultimate Strict Solana Pro Scanner Active!</b>\nFeatures active: Multi-source feed aggregation, Auto contract analyzer, Persistent state, PnL tracking, Safe liquidity validation."
     await update.message.reply_text(msg, parse_mode="HTML")
 
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -320,8 +329,27 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await update.message.reply_text(text=msg, parse_mode="HTML", reply_markup=reply_markup)
 
+async def handle_contract_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Automatically analyzes contract addresses pasted directly into chat."""
+    text = update.message.text.strip()
+    # Simple check for Solana contract address format (Base58, usually 32-44 characters)
+    if 32 <= len(text) <= 44 and not text.startswith("/"):
+        mint_addr = text
+        status_msg = await update.message.reply_text("🔍 Analyzing contract address...")
+        async with aiohttp.ClientSession() as session:
+            pair_data = await fetch_dex_pair_data(session, mint_addr)
+            if not pair_data:
+                await status_msg.edit_text("❌ Token or liquidity pair not found for this address.")
+                return
+                
+            rug_data = await fetch_rugcheck_report(session, mint_addr)
+            msg = build_advanced_card(pair_data, rug_data, extra_flag="DIRECT CONTRACT AUDIT")
+            reply_markup = get_quick_buy_keyboard(mint_addr)
+            
+            await status_msg.delete()
+            await update.message.reply_text(text=msg, parse_mode="HTML", reply_markup=reply_markup)
+
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Global exception handler to intercept and suppress button/callback interface crashes"""
     logging.error(f"Global exception caught: {context.error}")
 
 async def main():
@@ -332,6 +360,7 @@ async def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("check", check_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_contract_message))
     app.add_error_handler(global_error_handler)
     
     async with app:
@@ -341,7 +370,7 @@ async def main():
         await app.updater.start_polling(drop_pending_updates=True)
         
         asyncio.create_task(poll_dex_screener(app.bot))
-        logging.info("🚀 Comprehensive Production-Ready Scanner Started Successfully!")
+        logging.info("🚀 Full Multi-Source Solana Scanner Started Successfully!")
         while True:
             await asyncio.sleep(3600)
 
