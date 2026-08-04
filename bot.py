@@ -174,20 +174,41 @@ def compute_holder_trend(mint_addr, current_holders):
 
 # ==================== PRICE ====================
 async def get_sol_price_usd(session):
+    """Jupiter's old price.jup.ag endpoint was deprecated and now needs a
+    paid API key on api.jup.ag. Using CoinGecko's free public endpoint
+    instead — no key required, with Jupiter's free 'lite' tier as a backup."""
     now = time.time()
     if now - _sol_price_cache["ts"] < SOL_PRICE_CACHE_SECONDS:
         return _sol_price_cache["price"]
+
+    # Primary: CoinGecko (no key needed)
     try:
-        url = "https://price.jup.ag/v6/price?ids=SOL"
+        url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
         async with session.get(url, timeout=5) as response:
             if response.status == 200:
                 data = await response.json()
-                price = data.get("data", {}).get("SOL", {}).get("price")
+                price = data.get("solana", {}).get("usd")
                 if price:
                     _sol_price_cache["price"] = float(price)
                     _sol_price_cache["ts"] = now
+                    return _sol_price_cache["price"]
     except Exception as e:
-        logging.warning(f"SOL price fetch failed, using cached/fallback value: {e}")
+        logging.warning(f"CoinGecko SOL price fetch failed: {e}")
+
+    # Backup: Jupiter's free lite tier (no key required)
+    try:
+        url = "https://lite-api.jup.ag/price/v3?ids=So11111111111111111111111111111111111111112"
+        async with session.get(url, timeout=5) as response:
+            if response.status == 200:
+                data = await response.json()
+                price = data.get("So11111111111111111111111111111111111111112", {}).get("usdPrice")
+                if price:
+                    _sol_price_cache["price"] = float(price)
+                    _sol_price_cache["ts"] = now
+                    return _sol_price_cache["price"]
+    except Exception as e:
+        logging.warning(f"Jupiter lite SOL price fetch also failed, using cached/fallback value: {e}")
+
     return _sol_price_cache["price"]
 
 
