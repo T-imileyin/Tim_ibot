@@ -13,9 +13,9 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Con
 
 # ==================== CONFIGURATION ====================
 # SECURITY: tokens/keys must come from environment. Never hardcode them.
-TELEGRAM_BOT_TOKEN = os.getenv("8809386346:AAFVEb6hXB0E1OsfwJRsecIUTqqVSQbkemU")
-TELEGRAM_CHAT_ID = os.getenv("6411468031")
-HELIUS_API_KEY = os.getenv("41bfd346-afb5-45d6-8be8-b9fabf68f282")  # free tier at helius.dev — powers dev-wallet tracking
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")  # free tier at helius.dev — powers dev-wallet tracking
 
 CHECK_INTERVAL = 15
 TRACKED_COIN_MAX_AGE_HOURS = 72
