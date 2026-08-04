@@ -1,49 +1,51 @@
 import asyncio
 import difflib
+import json
 import logging
 import os
 import re
 import time
-import json
 from datetime import datetime, timezone
 
 import aiohttp
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 # ==================== CONFIGURATION ====================
-# SECURITY: tokens/keys must come from environment. Never hardcode them.
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")
-HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")  # free tier at helius.dev — powers dev-wallet tracking
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
 
 CHECK_INTERVAL = 15
 TRACKED_COIN_MAX_AGE_HOURS = 72
-DEV_RECHECK_INTERVAL_SECONDS = 900   # how often to re-check dev wallet activity per tracked coin
+DEV_RECHECK_INTERVAL_SECONDS = 900
 
-# STRICT SECURITY FILTERS
 MIN_HOLDERS = 2000
 MAX_TOP_10_SUPPLY_PCT = 30.0
 MAX_RUGCHECK_SCORE = 500
 MIN_LIQUIDITY_USD = 5000
 
-# API RATE LIMITING
 DEXSCREENER_CONCURRENCY = 5
 RUGCHECK_CONCURRENCY = 3
 HELIUS_CONCURRENCY = 3
 SOL_PRICE_CACHE_SECONDS = 60
 
-# A short, static list used only for copycat/near-duplicate name detection.
-# Not exhaustive — extend it with whatever's currently trending if you like.
 KNOWN_TICKERS = ["BONK", "WIF", "POPCAT", "PNUT", "MOODENG", "FARTCOIN", "GOAT", "PEPE", "TRUMP"]
-COPYCAT_SIMILARITY_THRESHOLD = 0.82  # 0-1, higher = stricter match required
+COPYCAT_SIMILARITY_THRESHOLD = 0.82
 
-# PERSISTENT STORAGE FILES
 SEEN_FILE = "seen_mints.json"
 TRACKED_COINS_FILE = "tracked_coins.json"
 
 SEEN_MINTS = set()
 TRACKED_COINS = {}
+TRENDING_COUNT = {}  # PATCH 6 — TRENDING TRACKER
 
 BASE58_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
@@ -52,10 +54,9 @@ rug_semaphore = asyncio.Semaphore(RUGCHECK_CONCURRENCY)
 helius_semaphore = asyncio.Semaphore(HELIUS_CONCURRENCY)
 
 _sol_price_cache = {"price": 180.0, "ts": 0.0}
-# =======================================================
 
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 
@@ -117,13 +118,10 @@ def is_valid_solana_address(text: str) -> bool:
 
 
 def is_quiet_launch_hour(pair_created_at_ms) -> bool:
-    """Heuristic only, not a hard fact: tokens launched during US overnight
-    hours (roughly 2am-6am US Eastern) tend to see thinner organic buying
-    and get sniped/dumped faster. Flag it, don't auto-reject on it."""
     if not pair_created_at_ms:
         return False
     dt = datetime.fromtimestamp(pair_created_at_ms / 1000.0, tz=timezone.utc)
-    return 6 <= dt.hour < 10  # approx 2am-6am US Eastern in UTC
+    return 6 <= dt.hour < 10
 
 
 def detect_wash_trading(txns_1h, volume_1h):
@@ -141,9 +139,6 @@ def detect_wash_trading(txns_1h, volume_1h):
 
 
 def detect_copycat(name, symbol):
-    """Flags near-duplicate names/tickers of well-known tokens or coins
-    already being tracked by this bot. Not proof of a scam — just a flag
-    worth a second look."""
     candidates = list(KNOWN_TICKERS) + [info.get("symbol", "") for info in TRACKED_COINS.values()]
     symbol_upper = (symbol or "").upper()
     for candidate in candidates:
@@ -156,8 +151,6 @@ def detect_copycat(name, symbol):
 
 
 def compute_holder_trend(mint_addr, current_holders):
-    """Compares current holder count against the earliest snapshot we have
-    for this coin. Returns a short trend string."""
     info = TRACKED_COINS.get(mint_addr)
     if not info or "holder_history" not in info or not info["holder_history"]:
         return "N/A (just started tracking)"
@@ -172,16 +165,48 @@ def compute_holder_trend(mint_addr, current_holders):
     return f"➡️ Flat ({delta:+d} holders since tracked)"
 
 
+# 🔥 PATCH 3 — SNIPER SCORING SYSTEM
+def sniper_score(pair, rug_data, unique_traders):
+    score = 0
+
+    liq = pair.get("liquidity", {}).get("usd", 0)
+    vol = pair.get("volume", {}).get("h1", 0)
+    pc = pair.get("priceChange", {}).get("h1", 0)
+    holders = rug_data.get("total_holders", 0)
+    top10 = rug_data.get("top_10_pct", 100)
+
+    buys = pair.get("txns", {}).get("h1", {}).get("buys", 0)
+    sells = pair.get("txns", {}).get("h1", {}).get("sells", 0)
+
+    if liq > 20000: score += 15
+    if liq > 50000: score += 10
+
+    if vol > 10000: score += 15
+    if vol > 50000: score += 10
+
+    if pc > 5: score += 10
+    if pc > 15: score += 10
+
+    if holders > 2000: score += 10
+    if holders > 5000: score += 10
+
+    if top10 < 30: score += 10
+
+    if buys > sells * 2:
+        score += 10
+
+    if unique_traders and unique_traders > 20:
+        score += 10
+
+    return min(score, 100)
+
+
 # ==================== PRICE ====================
 async def get_sol_price_usd(session):
-    """Jupiter's old price.jup.ag endpoint was deprecated and now needs a
-    paid API key on api.jup.ag. Using CoinGecko's free public endpoint
-    instead — no key required, with Jupiter's free 'lite' tier as a backup."""
     now = time.time()
     if now - _sol_price_cache["ts"] < SOL_PRICE_CACHE_SECONDS:
         return _sol_price_cache["price"]
 
-    # Primary: CoinGecko (no key needed)
     try:
         url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
         async with session.get(url, timeout=5) as response:
@@ -195,7 +220,6 @@ async def get_sol_price_usd(session):
     except Exception as e:
         logging.warning(f"CoinGecko SOL price fetch failed: {e}")
 
-    # Backup: Jupiter's free lite tier (no key required)
     try:
         url = "https://lite-api.jup.ag/price/v3?ids=So11111111111111111111111111111111111111112"
         async with session.get(url, timeout=5) as response:
@@ -207,16 +231,13 @@ async def get_sol_price_usd(session):
                     _sol_price_cache["ts"] = now
                     return _sol_price_cache["price"]
     except Exception as e:
-        logging.warning(f"Jupiter lite SOL price fetch also failed, using cached/fallback value: {e}")
+        logging.warning(f"Jupiter lite SOL price fetch also failed: {e}")
 
     return _sol_price_cache["price"]
 
 
-# ==================== RUGCHECK (security score, holders, authorities) ====================
+# ==================== RUGCHECK ====================
 async def fetch_rugcheck_report(session, mint_address):
-    """Only returns fields the RugCheck endpoint actually provides.
-    LP lock info is attempted defensively (field names aren't 100% documented
-    publicly) — falls back to 'N/A' rather than a guess if the shape doesn't match."""
     url = f"https://api.rugcheck.xyz/v1/tokens/{mint_address}/report"
     summary_url = f"https://api.rugcheck.xyz/v1/tokens/{mint_address}/report/summary"
 
@@ -255,8 +276,6 @@ async def fetch_rugcheck_report(session, mint_address):
     top_10_pct = sum(h.get("pct", 0) for h in top_holders[:10]) if top_holders else 0
     status_str = "🟢 SAFE" if score < 200 else "⚠️ WARN" if score < 700 else "🚨 HIGH RISK"
 
-    # Best-effort LP lock lookup — RugCheck's markets array shape isn't fully
-    # documented, so we try a couple of plausible paths and fall back cleanly.
     lp_lock_pct = "N/A"
     try:
         markets = data.get("markets", [])
@@ -285,7 +304,7 @@ async def fetch_rugcheck_report(session, mint_address):
     }
 
 
-# ==================== HELIUS (dev wallet tracking) ====================
+# ==================== HELIUS ====================
 def helius_rpc_url():
     return f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 
@@ -294,12 +313,6 @@ TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 
 
 async def fetch_accurate_holder_count(session, mint_address):
-    """RugCheck's holder count often lags badly on very new tokens (can show
-    0 or a stale number for tokens that are minutes old). This queries the
-    Solana blockchain directly via Helius for the real, current count of
-    accounts holding a nonzero balance of this mint — ground truth instead
-    of a cached index. Returns None if Helius isn't configured or the call
-    fails, so callers can fall back to RugCheck's number."""
     if not HELIUS_API_KEY:
         return None
     payload = {
@@ -355,9 +368,6 @@ async def fetch_wallet_sol_balance(session, wallet_address):
 
 
 async def fetch_dev_token_transfers(session, dev_wallet, mint_address, limit=25):
-    """Uses Helius Enhanced Transactions API to see if the dev wallet has
-    transferred/sold this specific token recently. Returns total amount
-    transferred OUT of the dev wallet for this mint, or None if unavailable."""
     if not HELIUS_API_KEY or not dev_wallet:
         return None
     url = f"https://api.helius.xyz/v0/addresses/{dev_wallet}/transactions?api-key={HELIUS_API_KEY}&limit={limit}"
@@ -381,9 +391,6 @@ async def fetch_dev_token_transfers(session, dev_wallet, mint_address, limit=25)
 
 
 async def fetch_unique_traders_1h(session, mint_address, limit=40):
-    """Rough count of unique wallets that swapped this token recently, via
-    Helius. Approximate — capped by `limit` transactions to control API usage.
-    Returns None if Helius isn't configured or the call fails."""
     if not HELIUS_API_KEY:
         return None
     url = f"https://api.helius.xyz/v0/addresses/{mint_address}/transactions?api-key={HELIUS_API_KEY}&limit={limit}"
@@ -405,8 +412,8 @@ async def fetch_unique_traders_1h(session, mint_address, limit=40):
 
 # ==================== MESSAGE CARD ====================
 def build_advanced_card(pair_data, rug_data, sol_price_usd, dev_info=None,
-                         holder_trend=None, copycat_of=None, unique_traders=None,
-                         extra_flag=None):
+                        holder_trend=None, copycat_of=None, unique_traders=None,
+                        extra_flag=None):
     base_token = pair_data.get("baseToken", {})
     symbol = base_token.get("symbol", "UNKNOWN")
     name = base_token.get("name", "")
@@ -536,9 +543,6 @@ async def build_dev_info(session, creator_wallet, mint_addr):
 
 
 def ensure_tracked(mint_addr, symbol, mc, creator):
-    """Make sure any coin the user checks (auto-scanned OR manually /check'd
-    OR pasted into chat) has a tracking entry, so holder trend and refresh
-    have history to compare against instead of always starting from scratch."""
     if mint_addr not in TRACKED_COINS:
         now_ts = time.time()
         TRACKED_COINS[mint_addr] = {
@@ -550,6 +554,7 @@ def ensure_tracked(mint_addr, symbol, mc, creator):
             "creator": creator,
             "holder_history": [],
             "last_dev_check_ts": now_ts,
+            "last_score": 0,
         }
 
 
@@ -561,8 +566,6 @@ async def run_full_analysis(session, mint_addr, extra_flag=None, record_snapshot
     sol_price = await get_sol_price_usd(session)
     rug_data = await fetch_rugcheck_report(session, mint_addr)
 
-    # Prefer the on-chain holder count over RugCheck's, since RugCheck can
-    # lag significantly on freshly launched tokens.
     accurate_holders = await fetch_accurate_holder_count(session, mint_addr)
     if accurate_holders is not None:
         rug_data["total_holders"] = accurate_holders
@@ -610,62 +613,107 @@ async def poll_dex_screener(bot):
                     mint_addr = token.get("tokenAddress") or token.get("address")
                     chain = token.get("chainId")
 
-                    if chain == "solana" and mint_addr and mint_addr not in SEEN_MINTS:
-                        SEEN_MINTS.add(mint_addr)
-                        pair_data = await fetch_dex_pair_data(session, mint_addr)
-                        if not pair_data:
-                            continue
+                    # 🔥 PATCH 2 — FIX SEEN LOGIC
+                    if chain != "solana" or not mint_addr:
+                        continue
 
-                        liq_usd = pair_data.get("liquidity", {}).get("usd", 0)
-                        liq_sol = pair_data.get("liquidity", {}).get("quote", 0)
-                        if liq_usd == 0 and liq_sol > 0:
-                            liq_usd = liq_sol * sol_price
-                        if liq_usd < MIN_LIQUIDITY_USD:
-                            continue
+                    if mint_addr in SEEN_MINTS:
+                        continue
 
-                        rug_data = await fetch_rugcheck_report(session, mint_addr)
-                        if not rug_data["ok"]:
-                            continue
+                    pair_data = await fetch_dex_pair_data(session, mint_addr)
+                    if not pair_data:
+                        continue
 
-                        # RugCheck's holder count lags on very new tokens —
-                        # verify against the actual on-chain count before
-                        # filtering, so real tokens don't get skipped due to
-                        # stale index data.
-                        accurate_holders = await fetch_accurate_holder_count(session, mint_addr)
-                        if accurate_holders is not None:
-                            rug_data["total_holders"] = accurate_holders
+                    liq_usd = pair_data.get("liquidity", {}).get("usd", 0)
+                    liq_sol = pair_data.get("liquidity", {}).get("quote", 0)
+                    if liq_usd == 0 and liq_sol > 0:
+                        liq_usd = liq_sol * sol_price
 
-                        if (
-                            rug_data["score"] > MAX_RUGCHECK_SCORE or
-                            rug_data["total_holders"] < MIN_HOLDERS or
-                            rug_data["top_10_pct"] > MAX_TOP_10_SUPPLY_PCT
-                        ):
-                            continue
+                    rug_data = await fetch_rugcheck_report(session, mint_addr)
+                    if not rug_data["ok"]:
+                        continue
 
-                        mc = pair_data.get("fdv") or pair_data.get("marketCap", 0)
-                        symbol = pair_data.get("baseToken", {}).get("symbol", "UNKNOWN")
-                        now_ts = time.time()
+                    accurate_holders = await fetch_accurate_holder_count(session, mint_addr)
+                    if accurate_holders is not None:
+                        rug_data["total_holders"] = accurate_holders
 
-                        ensure_tracked(mint_addr, symbol, mc, rug_data.get("creator"))
-                        TRACKED_COINS[mint_addr]["holder_history"] = [[now_ts, rug_data["total_holders"]]]
-                        save_persistence()
+                    # 🔥 PATCH 4 — STRICT ENTRY FILTER
+                    if not (
+                        liq_usd > 20000 and
+                        pair_data.get("volume", {}).get("h1", 0) > 10000 and
+                        pair_data.get("priceChange", {}).get("h1", 0) > 5 and
+                        rug_data["total_holders"] >= 2000
+                    ):
+                        continue
 
-                        name = pair_data.get("baseToken", {}).get("name", "")
-                        dev_info = await build_dev_info(session, rug_data.get("creator"), mint_addr)
-                        holder_trend = compute_holder_trend(mint_addr, rug_data["total_holders"])
-                        copycat_of = detect_copycat(name, symbol)
-                        unique_traders = await fetch_unique_traders_1h(session, mint_addr)
+                    if (
+                        rug_data["score"] > MAX_RUGCHECK_SCORE or
+                        rug_data["top_10_pct"] > MAX_TOP_10_SUPPLY_PCT
+                    ):
+                        continue
 
-                        msg = build_advanced_card(
-                            pair_data, rug_data, sol_price,
-                            dev_info=dev_info, holder_trend=holder_trend,
-                            copycat_of=copycat_of, unique_traders=unique_traders,
-                        )
+                    # 🔥 PATCH 2 — Mark SEEN ONLY AFTER passing all filters
+                    SEEN_MINTS.add(mint_addr)
+
+                    mc = pair_data.get("fdv") or pair_data.get("marketCap", 0)
+                    symbol = pair_data.get("baseToken", {}).get("symbol", "UNKNOWN")
+                    now_ts = time.time()
+
+                    ensure_tracked(mint_addr, symbol, mc, rug_data.get("creator"))
+                    TRACKED_COINS[mint_addr]["holder_history"] = [[now_ts, rug_data["total_holders"]]]
+
+                    name = pair_data.get("baseToken", {}).get("name", "")
+                    dev_info = await build_dev_info(session, rug_data.get("creator"), mint_addr)
+                    holder_trend = compute_holder_trend(mint_addr, rug_data["total_holders"])
+                    copycat_of = detect_copycat(name, symbol)
+                    unique_traders = await fetch_unique_traders_1h(session, mint_addr)
+
+                    msg = build_advanced_card(
+                        pair_data, rug_data, sol_price,
+                        dev_info=dev_info, holder_trend=holder_trend,
+                        copycat_of=copycat_of, unique_traders=unique_traders,
+                    )
+
+                    # 🔥 PATCH 7 — SMART MONEY SIGNAL (USING HELIUS)
+                    if unique_traders and unique_traders > 25:
+                        msg = "🧠 <b>SMART MONEY ACTIVE</b>\n" + msg
+
+                    # 🔥 PATCH 5 — LATE ENTRY SIGNAL
+                    score = sniper_score(pair_data, rug_data, unique_traders)
+                    prev_score = TRACKED_COINS[mint_addr].get("last_score", 0)
+
+                    if score >= 75 and prev_score < 75:
                         await bot.send_message(
-                            chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode="HTML",
+                            chat_id=TELEGRAM_CHAT_ID,
+                            text="🔁 <b>LATE SNIPER ENTRY</b>\n" + msg,
+                            parse_mode="HTML",
                             disable_web_page_preview=True,
                             reply_markup=get_quick_buy_keyboard(mint_addr),
                         )
+                    else:
+                        await bot.send_message(
+                            chat_id=TELEGRAM_CHAT_ID,
+                            text=msg,
+                            parse_mode="HTML",
+                            disable_web_page_preview=True,
+                            reply_markup=get_quick_buy_keyboard(mint_addr),
+                        )
+
+                    TRACKED_COINS[mint_addr]["last_score"] = score
+
+                    # 🔥 PATCH 6 — TRENDING ENGINE
+                    TRENDING_COUNT[mint_addr] = TRENDING_COUNT.get(mint_addr, 0) + 1
+                    if TRENDING_COUNT[mint_addr] >= 3:
+                        await bot.send_message(
+                            chat_id=TELEGRAM_CHAT_ID,
+                            text="🔥 <b>TRENDING COIN</b>\n" + msg,
+                            parse_mode="HTML",
+                            disable_web_page_preview=True,
+                            reply_markup=get_quick_buy_keyboard(mint_addr),
+                        )
+                        TRENDING_COUNT[mint_addr] = 0
+
+                    save_persistence()
 
                 # Re-check tracked coins: price milestones + periodic holder/dev snapshots
                 for mint_addr, info in list(TRACKED_COINS.items()):
@@ -691,7 +739,7 @@ async def poll_dex_screener(bot):
                         rug_data = await fetch_rugcheck_report(session, mint_addr)
                         if rug_data["ok"]:
                             info.setdefault("holder_history", []).append([time.time(), rug_data["total_holders"]])
-                            info["holder_history"] = info["holder_history"][-20:]  # keep it bounded
+                            info["holder_history"] = info["holder_history"][-20:]
                         info["last_dev_check_ts"] = time.time()
                         save_persistence()
 
@@ -701,8 +749,6 @@ async def poll_dex_screener(bot):
                             if total_sold is not None:
                                 previously_reported = info.get("dev_sold_reported", 0.0)
                                 new_amount = total_sold - previously_reported
-                                # Only alert on genuinely new movement, and
-                                # ignore tiny floating point noise.
                                 if new_amount > 0.01:
                                     await bot.send_message(
                                         chat_id=TELEGRAM_CHAT_ID,
@@ -738,86 +784,99 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args or not is_valid_solana_address(context.args[0]):
-        await update.message.reply_text("Usage: `/check <solana_mint_address>`", parse_mode="Markdown")
+    if not context.args:
+        await update.message.reply_text("Usage: /check <mint_address>")
         return
-    mint_addr = context.args[0]
+
+    mint_addr = context.args[0].strip()
+    if not is_valid_solana_address(mint_addr):
+        await update.message.reply_text("❌ Invalid Solana mint address format.")
+        return
+
+    status_msg = await update.message.reply_text("🔍 Fetching token analysis...")
+
     async with aiohttp.ClientSession() as session:
-        msg, _ = await run_full_analysis(session, mint_addr, extra_flag="MANUAL AUDIT REPORT")
+        msg, rug_data = await run_full_analysis(session, mint_addr, extra_flag="🔍 Manual Lookup")
         if not msg:
-            await update.message.reply_text("❌ Token not found on Dexscreener.")
+            await status_msg.edit_text("❌ Could not retrieve pair data from DexScreener.")
             return
-        await update.message.reply_text(text=msg, parse_mode="HTML", reply_markup=get_quick_buy_keyboard(mint_addr))
+
+        await status_msg.edit_text(
+            text=msg,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=get_quick_buy_keyboard(mint_addr)
+        )
 
 
 async def handle_contract_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if not is_valid_solana_address(text):
-        return
-    status_msg = await update.message.reply_text("🔍 Analyzing contract address...")
-    async with aiohttp.ClientSession() as session:
-        msg, _ = await run_full_analysis(session, text, extra_flag="DIRECT CONTRACT AUDIT")
-        if not msg:
-            await status_msg.edit_text("❌ Token or liquidity pair not found for this address.")
-            return
-        await status_msg.delete()
-        await update.message.reply_text(text=msg, parse_mode="HTML", reply_markup=get_quick_buy_keyboard(text))
+    text = update.message.text.strip() if update.message and update.message.text else ""
+    if is_valid_solana_address(text):
+        status_msg = await update.message.reply_text("🔍 Analyzing mint address...")
+        async with aiohttp.ClientSession() as session:
+            msg, rug_data = await run_full_analysis(session, text, extra_flag="🔍 Direct Address Lookup")
+            if not msg:
+                await status_msg.edit_text("❌ Could not retrieve pair data for this token.")
+                return
+
+            await status_msg.edit_text(
+                text=msg,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=get_quick_buy_keyboard(text)
+            )
 
 
 async def handle_refresh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer("Refreshing...")
+    await query.answer("Refreshing data...")
 
-    if not query.data.startswith("refresh:"):
-        return
-    mint_addr = query.data.split("refresh:", 1)[1]
-
-    async with aiohttp.ClientSession() as session:
-        msg, _ = await run_full_analysis(session, mint_addr, extra_flag="🔄 REFRESHED")
-        if not msg:
-            await query.answer("Token data unavailable right now.", show_alert=True)
-            return
-        try:
-            await query.edit_message_text(
-                text=msg, parse_mode="HTML", reply_markup=get_quick_buy_keyboard(mint_addr)
+    data = query.data
+    if data.startswith("refresh:"):
+        mint_addr = data.split("refresh:")[1]
+        async with aiohttp.ClientSession() as session:
+            msg, rug_data = await run_full_analysis(
+                session, mint_addr, extra_flag="🔄 Refreshed Snapshot", record_snapshot=True
             )
-        except Exception as e:
-            # Telegram raises an error if the new text is identical to the old
-            # one (nothing changed) — safe to ignore.
-            if "not modified" not in str(e).lower():
-                logging.warning(f"Failed to edit message on refresh: {e}")
+            if msg:
+                try:
+                    await query.edit_message_text(
+                        text=msg,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                        reply_markup=get_quick_buy_keyboard(mint_addr)
+                    )
+                except Exception as e:
+                    logging.warning(f"Error updating message: {e}")
 
 
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logging.error(f"Global exception caught: {context.error}")
+    logging.error(f"Exception while handling an update: {context.error}")
 
 
+# ✅ PATCH 1 — FIX TELEGRAM MAIN & RUN_POLLING
 async def main():
     if not TELEGRAM_BOT_TOKEN:
-        logging.critical("CRITICAL ERROR: TELEGRAM_BOT_TOKEN not set. export TELEGRAM_BOT_TOKEN='...'")
+        logging.critical("TELEGRAM_BOT_TOKEN not set")
         return
+
     if not TELEGRAM_CHAT_ID:
-        logging.critical("CRITICAL ERROR: CHAT_ID not set. export CHAT_ID='...'")
+        logging.critical("CHAT_ID not set")
         return
-    if not HELIUS_API_KEY:
-        logging.warning("HELIUS_API_KEY not set — dev wallet tracking will show 'N/A'. Get a free key at helius.dev")
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("check", check_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_contract_message))
     app.add_handler(CallbackQueryHandler(handle_refresh_callback, pattern=r"^refresh:"))
     app.add_error_handler(global_error_handler)
 
-    async with app:
-        await app.start()
-        await app.bot.delete_webhook(drop_pending_updates=True)
-        await asyncio.sleep(2)
-        await app.updater.start_polling(drop_pending_updates=True)
-        asyncio.create_task(poll_dex_screener(app.bot))
-        logging.info("🚀 Solana Scanner Started Successfully!")
-        while True:
-            await asyncio.sleep(3600)
+    asyncio.create_task(poll_dex_screener(app.bot))
+
+    logging.info("🚀 Bot started")
+
+    await app.run_polling()
 
 
 if __name__ == "__main__":
