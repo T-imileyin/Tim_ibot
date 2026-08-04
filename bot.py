@@ -697,14 +697,22 @@ async def poll_dex_screener(bot):
 
                         dev_wallet = info.get("creator")
                         if dev_wallet and HELIUS_API_KEY:
-                            sold_amount = await fetch_dev_token_transfers(session, dev_wallet, mint_addr)
-                            if sold_amount and sold_amount > 0:
-                                await bot.send_message(
-                                    chat_id=TELEGRAM_CHAT_ID,
-                                    text=(f"🔴 <b>DEV ACTIVITY:</b> ${info['symbol']} dev wallet has moved "
-                                          f"{sold_amount:,.0f} tokens out.\n<code>{mint_addr}</code>"),
-                                    parse_mode="HTML",
-                                )
+                            total_sold = await fetch_dev_token_transfers(session, dev_wallet, mint_addr)
+                            if total_sold is not None:
+                                previously_reported = info.get("dev_sold_reported", 0.0)
+                                new_amount = total_sold - previously_reported
+                                # Only alert on genuinely new movement, and
+                                # ignore tiny floating point noise.
+                                if new_amount > 0.01:
+                                    await bot.send_message(
+                                        chat_id=TELEGRAM_CHAT_ID,
+                                        text=(f"🔴 <b>DEV ACTIVITY:</b> ${info['symbol']} dev wallet moved "
+                                              f"{new_amount:,.0f} more tokens out (total so far: {total_sold:,.0f}).\n"
+                                              f"<code>{mint_addr}</code>"),
+                                        parse_mode="HTML",
+                                    )
+                                info["dev_sold_reported"] = total_sold
+                                save_persistence()
 
                 if time.time() - last_prune > 3600:
                     prune_tracked_coins()
