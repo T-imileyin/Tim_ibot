@@ -45,7 +45,7 @@ TRACKED_COINS_FILE = "tracked_coins.json"
 
 SEEN_MINTS = set()
 TRACKED_COINS = {}
-TRENDING_COUNT = {}  # PATCH 6 — TRENDING TRACKER
+TRENDING_COUNT = {}
 
 BASE58_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
@@ -165,7 +165,6 @@ def compute_holder_trend(mint_addr, current_holders):
     return f"➡️ Flat ({delta:+d} holders since tracked)"
 
 
-# 🔥 PATCH 3 — SNIPER SCORING SYSTEM
 def sniper_score(pair, rug_data, unique_traders):
     score = 0
 
@@ -613,7 +612,6 @@ async def poll_dex_screener(bot):
                     mint_addr = token.get("tokenAddress") or token.get("address")
                     chain = token.get("chainId")
 
-                    # 🔥 PATCH 2 — FIX SEEN LOGIC
                     if chain != "solana" or not mint_addr:
                         continue
 
@@ -637,7 +635,6 @@ async def poll_dex_screener(bot):
                     if accurate_holders is not None:
                         rug_data["total_holders"] = accurate_holders
 
-                    # 🔥 PATCH 4 — STRICT ENTRY FILTER
                     if not (
                         liq_usd > 20000 and
                         pair_data.get("volume", {}).get("h1", 0) > 10000 and
@@ -652,7 +649,6 @@ async def poll_dex_screener(bot):
                     ):
                         continue
 
-                    # 🔥 PATCH 2 — Mark SEEN ONLY AFTER passing all filters
                     SEEN_MINTS.add(mint_addr)
 
                     mc = pair_data.get("fdv") or pair_data.get("marketCap", 0)
@@ -674,11 +670,9 @@ async def poll_dex_screener(bot):
                         copycat_of=copycat_of, unique_traders=unique_traders,
                     )
 
-                    # 🔥 PATCH 7 — SMART MONEY SIGNAL (USING HELIUS)
                     if unique_traders and unique_traders > 25:
                         msg = "🧠 <b>SMART MONEY ACTIVE</b>\n" + msg
 
-                    # 🔥 PATCH 5 — LATE ENTRY SIGNAL
                     score = sniper_score(pair_data, rug_data, unique_traders)
                     prev_score = TRACKED_COINS[mint_addr].get("last_score", 0)
 
@@ -701,7 +695,6 @@ async def poll_dex_screener(bot):
 
                     TRACKED_COINS[mint_addr]["last_score"] = score
 
-                    # 🔥 PATCH 6 — TRENDING ENGINE
                     TRENDING_COUNT[mint_addr] = TRENDING_COUNT.get(mint_addr, 0) + 1
                     if TRENDING_COUNT[mint_addr] >= 3:
                         await bot.send_message(
@@ -715,7 +708,6 @@ async def poll_dex_screener(bot):
 
                     save_persistence()
 
-                # Re-check tracked coins: price milestones + periodic holder/dev snapshots
                 for mint_addr, info in list(TRACKED_COINS.items()):
                     pdata = await fetch_dex_pair_data(session, mint_addr)
                     if not pdata:
@@ -854,8 +846,12 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
     logging.error(f"Exception while handling an update: {context.error}")
 
 
-# ✅ PATCH 1 — FIX TELEGRAM MAIN & RUN_POLLING
-async def main():
+# ==================== POST INIT & MAIN ====================
+async def post_init(application):
+    asyncio.create_task(poll_dex_screener(application.bot))
+
+
+def main():
     if not TELEGRAM_BOT_TOKEN:
         logging.critical("TELEGRAM_BOT_TOKEN not set")
         return
@@ -864,7 +860,12 @@ async def main():
         logging.critical("CHAT_ID not set")
         return
 
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("check", check_command))
@@ -872,12 +873,10 @@ async def main():
     app.add_handler(CallbackQueryHandler(handle_refresh_callback, pattern=r"^refresh:"))
     app.add_error_handler(global_error_handler)
 
-    asyncio.create_task(poll_dex_screener(app.bot))
-
     logging.info("🚀 Bot started")
 
-    await app.run_polling()
+    app.run_polling()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
