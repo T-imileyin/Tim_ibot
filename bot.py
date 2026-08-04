@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 
 import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
 # ==================== CONFIGURATION ====================
 # SECURITY: tokens/keys must come from environment. Never hardcode them.
@@ -290,6 +290,53 @@ def helius_rpc_url():
     return f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 
 
+TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+
+
+async def fetch_accurate_holder_count(session, mint_address):
+    """RugCheck's holder count often lags badly on very new tokens (can show
+    0 or a stale number for tokens that are minutes old). This queries the
+    Solana blockchain directly via Helius for the real, current count of
+    accounts holding a nonzero balance of this mint — ground truth instead
+    of a cached index. Returns None if Helius isn't configured or the call
+    fails, so callers can fall back to RugCheck's number."""
+    if not HELIUS_API_KEY:
+        return None
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getProgramAccounts",
+        "params": [
+            TOKEN_PROGRAM_ID,
+            {
+                "encoding": "jsonParsed",
+                "filters": [
+                    {"dataSize": 165},
+                    {"memcmp": {"offset": 0, "bytes": mint_address}},
+                ],
+            },
+        ],
+    }
+    async with helius_semaphore:
+        try:
+            async with session.post(helius_rpc_url(), json=payload, timeout=15) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    accounts = data.get("result", [])
+                    holders = 0
+                    for acc in accounts:
+                        try:
+                            amount = acc["account"]["data"]["parsed"]["info"]["tokenAmount"]["uiAmount"]
+                            if amount and amount > 0:
+                                holders += 1
+                        except (KeyError, TypeError):
+                            continue
+                    return holders
+        except Exception as e:
+            logging.warning(f"Helius holder count fetch failed for {mint_address}: {e}")
+    return None
+
+
 async def fetch_wallet_sol_balance(session, wallet_address):
     if not HELIUS_API_KEY or not wallet_address:
         return None
@@ -424,6 +471,9 @@ def build_advanced_card(pair_data, rug_data, sol_price_usd, dev_info=None,
 def get_quick_buy_keyboard(mint_addr):
     keyboard = [
         [
+            InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{mint_addr}"),
+        ],
+        [
             InlineKeyboardButton("📊 Chart", url=f"https://dexscreener.com/solana/{mint_addr}"),
             InlineKeyboardButton("Trojan", url=f"https://t.me/solana_trojanbot?start=r-YOUR_REF_CODE-{mint_addr}"),
             InlineKeyboardButton("Photon", url=f"https://photon-sol.tinyastro.io/en/lp/{mint_addr}"),
@@ -485,15 +535,49 @@ async def build_dev_info(session, creator_wallet, mint_addr):
     }
 
 
-async def run_full_analysis(session, mint_addr, extra_flag=None):
+def ensure_tracked(mint_addr, symbol, mc, creator):
+    """Make sure any coin the user checks (auto-scanned OR manually /check'd
+    OR pasted into chat) has a tracking entry, so holder trend and refresh
+    have history to compare against instead of always starting from scratch."""
+    if mint_addr not in TRACKED_COINS:
+        now_ts = time.time()
+        TRACKED_COINS[mint_addr] = {
+            "entry_mc": mc,
+            "last_mc": mc,
+            "symbol": symbol,
+            "ath_multiplier": 1.0,
+            "first_seen_ts": now_ts,
+            "creator": creator,
+            "holder_history": [],
+            "last_dev_check_ts": now_ts,
+        }
+
+
+async def run_full_analysis(session, mint_addr, extra_flag=None, record_snapshot=True):
     pair_data = await fetch_dex_pair_data(session, mint_addr)
     if not pair_data:
         return None, None
 
     sol_price = await get_sol_price_usd(session)
     rug_data = await fetch_rugcheck_report(session, mint_addr)
+
+    # Prefer the on-chain holder count over RugCheck's, since RugCheck can
+    # lag significantly on freshly launched tokens.
+    accurate_holders = await fetch_accurate_holder_count(session, mint_addr)
+    if accurate_holders is not None:
+        rug_data["total_holders"] = accurate_holders
+
     symbol = pair_data.get("baseToken", {}).get("symbol", "")
     name = pair_data.get("baseToken", {}).get("name", "")
+    mc = pair_data.get("fdv") or pair_data.get("marketCap", 0)
+
+    ensure_tracked(mint_addr, symbol, mc, rug_data.get("creator"))
+
+    if record_snapshot:
+        info = TRACKED_COINS[mint_addr]
+        info.setdefault("holder_history", []).append([time.time(), rug_data["total_holders"]])
+        info["holder_history"] = info["holder_history"][-20:]
+        save_persistence()
 
     dev_info = await build_dev_info(session, rug_data.get("creator"), mint_addr)
     holder_trend = compute_holder_trend(mint_addr, rug_data["total_holders"])
@@ -543,6 +627,14 @@ async def poll_dex_screener(bot):
                         if not rug_data["ok"]:
                             continue
 
+                        # RugCheck's holder count lags on very new tokens —
+                        # verify against the actual on-chain count before
+                        # filtering, so real tokens don't get skipped due to
+                        # stale index data.
+                        accurate_holders = await fetch_accurate_holder_count(session, mint_addr)
+                        if accurate_holders is not None:
+                            rug_data["total_holders"] = accurate_holders
+
                         if (
                             rug_data["score"] > MAX_RUGCHECK_SCORE or
                             rug_data["total_holders"] < MIN_HOLDERS or
@@ -554,16 +646,8 @@ async def poll_dex_screener(bot):
                         symbol = pair_data.get("baseToken", {}).get("symbol", "UNKNOWN")
                         now_ts = time.time()
 
-                        TRACKED_COINS[mint_addr] = {
-                            "entry_mc": mc,
-                            "last_mc": mc,
-                            "symbol": symbol,
-                            "ath_multiplier": 1.0,
-                            "first_seen_ts": now_ts,
-                            "creator": rug_data.get("creator"),
-                            "holder_history": [[now_ts, rug_data["total_holders"]]],
-                            "last_dev_check_ts": now_ts,
-                        }
+                        ensure_tracked(mint_addr, symbol, mc, rug_data.get("creator"))
+                        TRACKED_COINS[mint_addr]["holder_history"] = [[now_ts, rug_data["total_holders"]]]
                         save_persistence()
 
                         name = pair_data.get("baseToken", {}).get("name", "")
@@ -672,6 +756,30 @@ async def handle_contract_message(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text(text=msg, parse_mode="HTML", reply_markup=get_quick_buy_keyboard(text))
 
 
+async def handle_refresh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Refreshing...")
+
+    if not query.data.startswith("refresh:"):
+        return
+    mint_addr = query.data.split("refresh:", 1)[1]
+
+    async with aiohttp.ClientSession() as session:
+        msg, _ = await run_full_analysis(session, mint_addr, extra_flag="🔄 REFRESHED")
+        if not msg:
+            await query.answer("Token data unavailable right now.", show_alert=True)
+            return
+        try:
+            await query.edit_message_text(
+                text=msg, parse_mode="HTML", reply_markup=get_quick_buy_keyboard(mint_addr)
+            )
+        except Exception as e:
+            # Telegram raises an error if the new text is identical to the old
+            # one (nothing changed) — safe to ignore.
+            if "not modified" not in str(e).lower():
+                logging.warning(f"Failed to edit message on refresh: {e}")
+
+
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logging.error(f"Global exception caught: {context.error}")
 
@@ -690,6 +798,7 @@ async def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("check", check_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_contract_message))
+    app.add_handler(CallbackQueryHandler(handle_refresh_callback, pattern=r"^refresh:"))
     app.add_error_handler(global_error_handler)
 
     async with app:
